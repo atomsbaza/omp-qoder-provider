@@ -2,6 +2,8 @@
 
 Use [Qoder](https://qoder.com) as a model provider inside [omp](https://github.com/can1357/oh-my-pi) — officially supported surface only: the extension spawns the local `qodercli` binary in headless print mode per request and translates its stream-json output into canonical omp assistant-message events. No protocol impersonation, no API keys, no WAF tricks; the child authenticates with your own Qoder sign-in and bills your existing Qoder plan credits.
 
+> Independent community tool. Not affiliated with or endorsed by Qoder or the omp project.
+
 ## Requirements
 
 - omp (`~/.local/bin/omp`) — extension API with `pi.registerProvider`
@@ -71,3 +73,7 @@ omp session ── provider "qoder" ── spawn qodercli (headless, stream-json
 - Prompts, file excerpts, and tool results travel to the Qoder model service — treat the child like any cloud-model provider. Don't point it at workspaces with secrets or employer code you may not send there.
 - The child executes with Qoder's permission system, not omp's; `dont_ask` denies anything that would normally prompt. Review the mode before switching.
 - The repo contains no credentials; the child reads your local `qodercli` sign-in state.
+
+## License
+
+[MIT](LICENSE)
