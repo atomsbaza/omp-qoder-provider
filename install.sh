@@ -44,6 +44,22 @@ mkdir -p "$TARGET_DIR"
 cp -f "$EXT_FILE" "$TARGET"
 echo "installed: $TARGET"
 
+# Optional: remaining-credit display via the official Qoder SDK (Node 18+).
+VENDOR_DIR="${QODER_BRIDGE_VENDOR_DIR:-$HOME/.omp/agent/vendor/qoder-sdk}"
+if command -v node >/dev/null 2>&1; then
+	mkdir -p "$VENDOR_DIR"
+	cp -f "$SCRIPT_DIR/qoder-usage-helper.cjs" "$VENDOR_DIR/"
+	if [[ -d "$VENDOR_DIR/node_modules/@qoder-ai/qoder-agent-sdk" ]]; then
+		echo "usage helper: already installed ($VENDOR_DIR)"
+	elif (cd "$VENDOR_DIR" && npm init -y >/dev/null 2>&1 && npm i @qoder-ai/qoder-agent-sdk@1.0.58 --no-audit --no-fund >/dev/null 2>&1); then
+		echo "usage helper: installed ($VENDOR_DIR)"
+	else
+		echo "warning: vendor SDK install failed — remaining-credit display unavailable; spent tracking still works" >&2
+	fi
+else
+	echo "warning: node not found — remaining-credit display unavailable; spent tracking still works" >&2
+fi
+
 cat <<'EOF'
 
 Next steps:
@@ -58,6 +74,10 @@ Optional knobs (environment variables):
   QODER_BRIDGE_PERMISSION_MODE  child permission mode     (default: dont_ask;
                                 use accept_edits to let the child edit files)
   QODER_BRIDGE_LOG              append spawn/result diagnostics to a file
+  QODER_BRIDGE_COST_AS_CREDITS  set to 1 to show credit spend as the model cost
+  QODER_BRIDGE_CREDITS_FILE     all-time credits ledger   (default: ~/.omp/agent/qoder-credits.json)
+
+Session command: /qoder-credits — remaining quota + credits spent
 EOF
 
 if [[ "$have_bin" == true ]]; then

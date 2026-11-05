@@ -9,6 +9,7 @@ Use [Qoder](https://qoder.com) as a model provider inside [omp](https://github.c
 - omp (`~/.local/bin/omp`) — extension API with `pi.registerProvider`
 - [Qoder CLI](https://www.npmjs.com/package/@qoder-ai/qodercli) installed and signed in (`qodercli login`); developed against v1.1.83
 - A Qoder plan with credits (each request bills credits via the child, reported per response)
+- Node 18+ (optional) — only for the remaining-quota display
 
 ## Install
 
@@ -53,6 +54,19 @@ omp session ── provider "qoder" ── spawn qodercli (headless, stream-json
      └── canonical assistant events ─────┘
 ```
 
+## Images
+
+Models declare `["text", "image"]` input. Images in the omp conversation are written to temp files and passed to the child via `qodercli --attachment` (verified with PNG; JPEG/WebP/GIF mapped by extension, up to 10 per request). Attachments land on the child's initial prompt — history images are re-attached as `[image #N attached]` markers in the transcript, not positioned per turn.
+
+## Credits and usage
+
+Every response carries the credits it cost (`message.details.credits`, from the child's own accounting) and is added to a local ledger:
+
+- `/qoder-credits` (in an omp session) — remaining quota (when available), plus credits spent in this omp process and all-time (stored in `~/.omp/agent/qoder-credits.json`).
+- Set `QODER_BRIDGE_COST_AS_CREDITS=1` to mirror per-run credits into `usage.cost.total`, so omp's statusline/usage cost shows credit spend (unit is credits, not USD).
+
+**Remaining quota** comes from the official `@qoder-ai/qoder-agent-sdk` (`getUsageInfo()` over the CLI's own control channel — no agent turn is billed). `install.sh` sets it up under `~/.omp/agent/vendor/qoder-sdk` (needs Node 18+ and network access to `download.qoder.com`/npm). Status on the dev machine (macOS, qodercli 1.1.83 + SDK 1.0.58): the SDK daemon fails to start under both Bun and Node, so remaining quota reports `unavailable` there; spent tracking is unaffected. The extension negative-caches failures for 10 minutes, so a broken helper never stalls sessions.
+
 ## Knobs
 
 | Variable | Default | Purpose |
@@ -60,13 +74,18 @@ omp session ── provider "qoder" ── spawn qodercli (headless, stream-json
 | `QODER_BRIDGE_BIN` | `qodercli` | qodercli binary path |
 | `QODER_BRIDGE_PERMISSION_MODE` | `dont_ask` | child permission mode; `accept_edits` lets the child edit files, `bypass_permissions` removes its guardrails (not recommended) |
 | `QODER_BRIDGE_LOG` | unset | append spawn/result diagnostics to a file |
+| `QODER_BRIDGE_COST_AS_CREDITS` | off | mirror per-run credits into `usage.cost.total` |
+| `QODER_BRIDGE_CREDITS_FILE` | `~/.omp/agent/qoder-credits.json` | all-time credits ledger |
+| `QODER_BRIDGE_VENDOR_DIR` | `~/.omp/agent/vendor/qoder-sdk` | SDK install location for the remaining-quota helper |
+| `QODER_BRIDGE_USAGE_HELPER` | `<vendor dir>/qoder-usage-helper.cjs` | helper script run under Node |
 
 ## Limitations
 
-- Delegate mode: the child never sees omp's tool schemas, and omp's tools are not bridged in; history is flattened to text (images are dropped).
-- Text input only; `contextWindow` metadata is a conservative 128k placeholder, not measured.
+- Delegate mode: the child never sees omp's tool schemas, and omp's tools are not bridged in; history is flattened to text (images travel as attachments, not per-turn placement).
 - One child run per request: repeated follow-ups re-send the whole transcript as text.
 - Stop reasons other than success map to stream errors (no length/toolUse distinction).
+- `contextWindow` metadata is a conservative 128k placeholder, not measured.
+- Images in tool results are not forwarded (only user-turn images).
 
 ## Security notes
 

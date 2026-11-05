@@ -13,12 +13,60 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 
 const QODER_BIN = process.env.QODER_BRIDGE_BIN || "qodercli";
 const PERMISSION_MODE = process.env.QODER_BRIDGE_PERMISSION_MODE || "dont_ask";
 const MAX_PROMPT_CHARS = 300_000;
 const DEBUG_LOG = process.env.QODER_BRIDGE_LOG;
+// Mirror per-run credits into usage.cost.total so omp's statusline/usage cost
+// shows credit spend (unit is credits, not USD).
+const COST_AS_CREDITS = process.env.QODER_BRIDGE_COST_AS_CREDITS === "1";
+const CREDITS_FILE =
+	process.env.QODER_BRIDGE_CREDITS_FILE || join(homedir(), ".omp", "agent", "qoder-credits.json");
+const VENDOR_DIR = process.env.QODER_BRIDGE_VENDOR_DIR || join(homedir(), ".omp", "agent", "vendor", "qoder-sdk");
+const USAGE_HELPER = process.env.QODER_BRIDGE_USAGE_HELPER || join(VENDOR_DIR, "qoder-usage-helper.cjs");
+const USAGE_CACHE_MS = 60_000;
+
+let sessionCredits = 0;
+let creditsWriteWarned = false;
+
+interface CreditsFile {
+	allTime: number;
+	updatedAt: string;
+}
+
+function isCreditsFile(value: unknown): value is CreditsFile {
+	return (
+		isRecord(value) && typeof value.allTime === "number" && Number.isFinite(value.allTime)
+	);
+}
+
+function loadAllTimeCredits(): number {
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(CREDITS_FILE, "utf8"));
+		return isCreditsFile(parsed) ? parsed.allTime : 0;
+	} catch {
+		return 0;
+	}
+}
+
+function recordCredits(credits: number): void {
+	if (!(credits > 0)) return;
+	const allTime = loadAllTimeCredits() + credits;
+	try {
+		mkdirSync(join(CREDITS_FILE, ".."), { recursive: true });
+		const payload: CreditsFile = { allTime, updatedAt: new Date().toISOString() };
+		writeFileSync(CREDITS_FILE, `${JSON.stringify(payload, null, "\t")}\n`);
+	} catch (error) {
+		if (!creditsWriteWarned) {
+			creditsWriteWarned = true;
+			process.stderr.write(`qoder-bridge: cannot update ${CREDITS_FILE}: ${String(error)}\n`);
+		}
+	}
+}
 
 function debugLog(line: string): void {
 	if (!DEBUG_LOG) return;
@@ -81,23 +129,57 @@ function textFromContent(content: unknown): string {
 	return parts.join("\n");
 }
 
-function serializeContext(context: unknown): string {
+const MAX_IMAGES = 10;
+
+interface ImageAttachment {
+	data: string;
+	extension: string;
+}
+
+const IMAGE_EXTENSIONS: Record<string, string> = {
+	"image/png": "png",
+	"image/jpeg": "jpg",
+	"image/webp": "webp",
+	"image/gif": "gif",
+};
+
+function buildRequest(context: unknown): { prompt: string; images: ImageAttachment[] } {
 	const messages = isRecord(context) ? asArray(context.messages) : [];
 	const parts: string[] = [];
+	const images: ImageAttachment[] = [];
 	for (const msg of messages) {
 		if (!isRecord(msg)) continue;
-		const text =
-			textFromContent(msg.content) || textFromContent(isRecord(msg.output) ? msg.output.content : undefined);
-		if (!text.trim()) continue;
+		const textParts: string[] = [];
+		let imageSeen = false;
+		for (const block of asArray(msg.content)) {
+			if (!isRecord(block)) continue;
+			if (block.type === "text" && typeof block.text === "string" && block.text) {
+				textParts.push(block.text);
+				continue;
+			}
+			if (block.type === "image" && typeof block.data === "string" && block.data) {
+				const raw = block.data.startsWith("data:") ? block.data.slice(block.data.indexOf(",") + 1) : block.data;
+				const extension = IMAGE_EXTENSIONS[asString(block.mimeType) ?? ""] ?? "";
+				if (!extension || !raw || images.length >= MAX_IMAGES) continue;
+				images.push({ data: raw, extension });
+				textParts.push(`[image #${images.length} attached]`);
+				imageSeen = true;
+			}
+		}
+		const fallback = textFromContent(isRecord(msg.output) ? msg.output.content : undefined);
+		const text = (textParts.length ? textParts.join("\n") : "") || fallback;
+		if (!text.trim() && !imageSeen) continue;
 		if (msg.role === "toolResult") {
 			parts.push(`[tool result: ${asString(msg.toolName) ?? "tool"}]\n${text}`);
 		} else {
 			parts.push(`[${asString(msg.role) ?? "message"}]\n${text}`);
 		}
 	}
-	const transcript = parts.join("\n\n");
-	if (transcript.length <= MAX_PROMPT_CHARS) return transcript;
-	return "[earlier conversation truncated]\n\n" + transcript.slice(transcript.length - MAX_PROMPT_CHARS);
+	let prompt = parts.join("\n\n");
+	if (prompt.length > MAX_PROMPT_CHARS) {
+		prompt = "[earlier conversation truncated]\n\n" + prompt.slice(prompt.length - MAX_PROMPT_CHARS);
+	}
+	return { prompt, images };
 }
 
 function childEnvironment(): NodeJS.ProcessEnv {
@@ -117,7 +199,122 @@ interface ContentBlock {
 	thinking?: string;
 }
 
+interface QuotaSnapshot {
+	error?: unknown;
+	userQuota?: { total?: unknown; used?: unknown; remaining?: unknown; unit?: unknown };
+	addOnQuota?: { cap?: unknown; used?: unknown; remaining?: unknown; unit?: unknown };
+	totalUsagePercentage?: unknown;
+	isQuotaExceeded?: unknown;
+}
+
+let usageCache: { report: unknown; remaining: string; fetchedAt: number } | null = null;
+
+function runUsageHelper(): Promise<string> {
+	const { promise, resolve, reject } = Promise.withResolvers<string>();
+	const child = spawn("node", [USAGE_HELPER], { stdio: ["ignore", "pipe", "pipe"] });
+	let out = "";
+	const timer = setTimeout(() => {
+		child.kill("SIGKILL");
+		reject(new Error("usage helper timed out"));
+	}, 20_000);
+	child.stdout?.setEncoding("utf8");
+	child.stdout?.on("data", (chunk: string) => {
+		out += chunk;
+	});
+	child.stderr?.resume();
+	child.on("error", (error) => {
+		clearTimeout(timer);
+		reject(error);
+	});
+	child.on("close", () => {
+		clearTimeout(timer);
+		resolve(out);
+	});
+	return promise;
+}
+
+function parseQuotaSnapshot(output: string): QuotaSnapshot | null {
+	const lines = output.trim().split("\n");
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const line = lines[i]?.trim();
+		if (!line || !line.startsWith("{")) continue;
+		try {
+			const parsed: unknown = JSON.parse(line);
+			if (isRecord(parsed)) {
+				debugLog(`usage snapshot: ${line.slice(0, 200)}`);
+				return parsed as QuotaSnapshot;
+			}
+		} catch {}
+	}
+	return null;
+}
+
+function quotaLimit(
+	quota: { total?: unknown; used?: unknown; unit?: unknown },
+	id: string,
+	label: string,
+): Record<string, unknown> | null {
+	if (typeof quota.total !== "number" || typeof quota.used !== "number") return null;
+	return {
+		id,
+		label,
+		scope: { provider: "qoder" },
+		amount: { used: quota.used, limit: quota.total, unit: asString(quota.unit) ?? "credits" },
+	};
+}
+
+let usageFailedUntil = 0;
+
+async function fetchQuotaReport(): Promise<unknown> {
+	if (usageCache && Date.now() - usageCache.fetchedAt < USAGE_CACHE_MS) return usageCache.report;
+	if (Date.now() < usageFailedUntil) return null;
+	try {
+		const snapshot = await parseQuotaSnapshot(await runUsageHelper());
+		if (!snapshot || typeof snapshot.error === "string") {
+			// Negative-cache so a broken helper cannot stall every usage read.
+			usageFailedUntil = Date.now() + 600_000;
+			return null;
+		}
+		const limits: Record<string, unknown>[] = [];
+		const plan = isRecord(snapshot.userQuota) ? snapshot.userQuota : undefined;
+		const planLimit = plan ? quotaLimit(plan, "plan", "Plan credits") : null;
+		if (planLimit) limits.push(planLimit);
+		const addOn = isRecord(snapshot.addOnQuota) ? snapshot.addOnQuota : undefined;
+		const addOnLimit = addOn
+			? quotaLimit({ total: addOn.cap, used: addOn.used, unit: addOn.unit }, "addon", "Add-on credits")
+			: null;
+		if (addOnLimit) limits.push(addOnLimit);
+		if (limits.length === 0) {
+			debugLog("usage snapshot had no numeric quota buckets");
+			return null;
+		}
+		const remaining = plan && typeof plan.remaining === "number" ? `${plan.remaining}/${plan.total ?? "?"}` : "";
+		const report = { provider: "qoder", fetchedAt: Date.now(), limits };
+		usageCache = { report, remaining, fetchedAt: Date.now() };
+		return report;
+	} catch (error) {
+		debugLog(`usage fetch failed: ${String(error).slice(0, 200)}`);
+		usageFailedUntil = Date.now() + 600_000;
+		return null;
+	}
+}
+
 export default function qoderProvider(pi: ExtensionAPI) {
+	pi.registerCommand("qoder-credits", {
+		description: "Show Qoder credits (remaining / this process / all-time)",
+		handler: async (_args, ctx) => {
+			const allTime = loadAllTimeCredits();
+			const report = await fetchQuotaReport();
+			const remaining =
+				report && usageCache?.remaining
+					? `remaining: ${usageCache.remaining}`
+					: "remaining: unavailable (install the usage helper — see README)";
+			ctx.ui.notify(
+				`Qoder credits — ${remaining} · this omp process: ${sessionCredits.toFixed(4)} · all-time: ${allTime.toFixed(4)}`,
+				"info",
+			);
+		},
+	});
 	pi.registerProvider("qoder", {
 		baseUrl: "qoder://local-cli-bridge",
 		apiKey: "qodercli-local-auth",
@@ -127,11 +324,15 @@ export default function qoderProvider(pi: ExtensionAPI) {
 			void runBridge(stream, model, context, options);
 			return stream;
 		},
+		usage: {
+			id: "qoder",
+			fetchUsage: () => fetchQuotaReport(),
+		},
 		models: MODEL_SPECS.map((spec) => ({
 			id: spec.id,
 			name: spec.name,
 			reasoning: true,
-			input: ["text"],
+			input: ["text", "image"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: spec.contextWindow,
 			maxTokens: 16_384,
@@ -176,6 +377,29 @@ async function runBridge(stream: AssistantMessageEventStream, model: unknown, co
 		args.push("--max-output-tokens", String(Math.floor(maxTokens)));
 	}
 
+	const { prompt, images } = buildRequest(context);
+	const imageDir = join(tmpdir(), `qoder-bridge-${process.pid}-${Date.now()}`);
+	const attachmentFiles: string[] = [];
+	const cleanupImages = () => {
+		if (attachmentFiles.length === 0) return;
+		try {
+			rmSync(imageDir, { recursive: true, force: true });
+		} catch {}
+	};
+	if (images.length > 0) {
+		try {
+			mkdirSync(imageDir, { recursive: true });
+			images.forEach((image, index) => {
+				const file = join(imageDir, `image-${index + 1}.${image.extension}`);
+				writeFileSync(file, Buffer.from(image.data, "base64"));
+				attachmentFiles.push(file);
+				args.push("--attachment", file);
+			});
+		} catch (error) {
+			debugLog(`attachment staging failed: ${String(error)}`);
+		}
+	}
+
 	const cwd = isRecord(options) && typeof options.cwd === "string" ? options.cwd : process.cwd();
 	debugLog(`spawn model=${String(modelId)} cwd=${cwd} args=${args.join(" ")}`);
 	let child: ChildProcess;
@@ -199,6 +423,7 @@ async function runBridge(stream: AssistantMessageEventStream, model: unknown, co
 		try {
 			child.kill("SIGTERM");
 		} catch {}
+		cleanupImages();
 	};
 	signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -292,7 +517,14 @@ async function runBridge(stream: AssistantMessageEventStream, model: unknown, co
 		usage.input = typeof reported.input_tokens === "number" ? reported.input_tokens : 0;
 		usage.output = typeof reported.output_tokens === "number" ? reported.output_tokens : 0;
 		usage.totalTokens = (usage.input as number) + (usage.output as number);
-		partial.details = { credits: event.total_credits, provider: "qoder" };
+		const credits = typeof event.total_credits === "number" ? event.total_credits : 0;
+		sessionCredits += credits;
+		recordCredits(credits);
+		if (COST_AS_CREDITS && credits > 0) {
+			const cost = usage.cost as Record<string, number>;
+			cost.total = credits;
+		}
+		partial.details = { credits, provider: "qoder" };
 		stream.push({ type: "done", reason: "stop", message: partial });
 	};
 
@@ -319,6 +551,7 @@ async function runBridge(stream: AssistantMessageEventStream, model: unknown, co
 
 	child.on("close", (code) => {
 		signal?.removeEventListener("abort", onAbort);
+		cleanupImages();
 		if (finished) return;
 		if (signal?.aborted) {
 			failOnce(true, "Request aborted");
@@ -329,7 +562,7 @@ async function runBridge(stream: AssistantMessageEventStream, model: unknown, co
 	});
 
 	try {
-		child.stdin?.write(serializeContext(context));
+		child.stdin?.write(prompt);
 		child.stdin?.end();
 	} catch (error) {
 		failOnce(false, `Failed to write prompt to qodercli: ${String(error)}`);
