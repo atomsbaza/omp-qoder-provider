@@ -1,0 +1,19 @@
+{
+	"name": "omp-qoder-provider",
+	"version": "1.0.0",
+	"description": "Qoder as an omp model provider: official ACP mode (qoder --acp) and headless print-mode bridge over the local qodercli",
+	"license": "MIT",
+	"private": true,
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/atomsbaza/omp-qoder-provider.git"
+	},
+	"files": [
+		"qoder-provider.ts",
+		"qoder-acp-provider.ts",
+		"qoder-usage-helper.cjs",
+		"install.sh",
+		"README.md",
+		"LICENSE"
+	]
+}
