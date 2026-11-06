@@ -49,10 +49,10 @@ VENDOR_DIR="${QODER_BRIDGE_VENDOR_DIR:-$HOME/.omp/agent/vendor/qoder-sdk}"
 if command -v node >/dev/null 2>&1; then
 	mkdir -p "$VENDOR_DIR"
 	cp -f "$SCRIPT_DIR/qoder-usage-helper.cjs" "$VENDOR_DIR/"
-	if [[ -d "$VENDOR_DIR/node_modules/@qoder-ai/qoder-agent-sdk" ]]; then
-		echo "usage helper: already installed ($VENDOR_DIR)"
-	elif (cd "$VENDOR_DIR" && npm init -y >/dev/null 2>&1 && npm i @qoder-ai/qoder-agent-sdk@1.0.58 --no-audit --no-fund >/dev/null 2>&1); then
-		echo "usage helper: installed ($VENDOR_DIR)"
+	if [[ -d "$VENDOR_DIR/node_modules/@qoder-ai/qoder-agent-sdk" && -d "$VENDOR_DIR/node_modules/@agentclientprotocol/sdk" ]]; then
+		echo "usage helper + ACP SDK: already installed ($VENDOR_DIR)"
+	elif (cd "$VENDOR_DIR" && npm init -y >/dev/null 2>&1 && npm i @qoder-ai/qoder-agent-sdk@1.0.58 @agentclientprotocol/sdk@0.17.1 --no-audit --no-fund >/dev/null 2>&1); then
+		echo "usage helper + ACP SDK: installed ($VENDOR_DIR)"
 	else
 		echo "warning: vendor SDK install failed — remaining-credit display unavailable; spent tracking still works" >&2
 	fi

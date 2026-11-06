@@ -19,7 +19,10 @@ import { join } from "node:path";
 
 const QODER_BIN = process.env.QODER_BRIDGE_BIN || "qodercli";
 const PERMISSION_MODE = process.env.QODER_BRIDGE_PERMISSION_MODE || "dont_ask";
-const MAX_PROMPT_CHARS = 300_000;
+// Frontier models support 200K/400K/1M context (docs.qoder.com/cli/model).
+// Pass --context-window only for specific models, not the auto/efficient pools.
+const CONTEXT_WINDOW = Number(process.env.QODER_BRIDGE_CONTEXT_WINDOW) || 1_000_000;
+const MAX_PROMPT_CHARS = Number(process.env.QODER_BRIDGE_MAX_PROMPT_CHARS) || 4_000_000;
 const DEBUG_LOG = process.env.QODER_BRIDGE_LOG;
 // Mirror per-run credits into usage.cost.total so omp's statusline/usage cost
 // shows credit spend (unit is credits, not USD).
@@ -103,19 +106,21 @@ function createEmptyUsage(): Record<string, number | Record<string, number>> {
 }
 
 // -m values are Qoder display names (`qodercli --list-models`).
-const MODEL_SPECS: Array<{ id: string; flag?: string; name: string; contextWindow: number }> = [
-	{ id: "auto", name: "Qoder Auto", contextWindow: 128_000 },
-	{ id: "efficient", flag: "Efficient", name: "Qoder Efficient", contextWindow: 128_000 },
-	{ id: "qwen3.8-max", flag: "Qwen3.8-Max", name: "Qwen3.8-Max (Qoder)", contextWindow: 128_000 },
-	{ id: "qwen3.8-flash", flag: "Qwen3.8-Flash", name: "Qwen3.8-Flash (Qoder)", contextWindow: 128_000 },
-	{ id: "kimi-k3.1-pro", flag: "Kimi-K3.1-Pro", name: "Kimi K3.1 Pro (Qoder)", contextWindow: 128_000 },
-	{ id: "kimi-k2.8-preview", flag: "Kimi-K2.8-Preview", name: "Kimi K2.8 Preview (Qoder)", contextWindow: 128_000 },
-	{ id: "glm-5.3", flag: "GLM-5.3", name: "GLM-5.3 (Qoder)", contextWindow: 128_000 },
-	{ id: "glm-5.3-flash", flag: "GLM-5.3-Flash", name: "GLM-5.3 Flash (Qoder)", contextWindow: 128_000 },
-	{ id: "deepseek-v4-pro", flag: "DeepSeek-V4-Pro", name: "DeepSeek V4 Pro (Qoder)", contextWindow: 128_000 },
-	{ id: "deepseek-flash", flag: "DeepSeek-Flash", name: "DeepSeek Flash (Qoder)", contextWindow: 128_000 },
-	{ id: "minimax-m3.1-flash", flag: "MiniMax-M3.1-Flash", name: "MiniMax M3.1 Flash (Qoder)", contextWindow: 128_000 },
+const MODEL_SPECS: Array<{ id: string; flag?: string; name: string }> = [
+	{ id: "auto", name: "Qoder Auto" },
+	{ id: "efficient", flag: "Efficient", name: "Qoder Efficient" },
+	{ id: "qwen3.8-max", flag: "Qwen3.8-Max", name: "Qwen3.8-Max (Qoder)" },
+	{ id: "qwen3.8-flash", flag: "Qwen3.8-Flash", name: "Qwen3.8-Flash (Qoder)" },
+	{ id: "kimi-k3.1-pro", flag: "Kimi-K3.1-Pro", name: "Kimi K3.1 Pro (Qoder)" },
+	{ id: "kimi-k2.8-preview", flag: "Kimi-K2.8-Preview", name: "Kimi K2.8 Preview (Qoder)" },
+	{ id: "glm-5.3", flag: "GLM-5.3", name: "GLM-5.3 (Qoder)" },
+	{ id: "glm-5.3-flash", flag: "GLM-5.3-Flash", name: "GLM-5.3 Flash (Qoder)" },
+	{ id: "deepseek-v4-pro", flag: "DeepSeek-V4-Pro", name: "DeepSeek V4 Pro (Qoder)" },
+	{ id: "deepseek-flash", flag: "DeepSeek-Flash", name: "DeepSeek Flash (Qoder)" },
+	{ id: "minimax-m3.1-flash", flag: "MiniMax-M3.1-Flash", name: "MiniMax M3.1 Flash (Qoder)" },
 ];
+
+let activeContextWindow = CONTEXT_WINDOW;
 
 function textFromContent(content: unknown): string {
 	if (typeof content === "string") return content;
@@ -299,23 +304,8 @@ async function fetchQuotaReport(): Promise<unknown> {
 	}
 }
 
-export default function qoderProvider(pi: ExtensionAPI) {
-	pi.registerCommand("qoder-credits", {
-		description: "Show Qoder credits (remaining / this process / all-time)",
-		handler: async (_args, ctx) => {
-			const allTime = loadAllTimeCredits();
-			const report = await fetchQuotaReport();
-			const remaining =
-				report && usageCache?.remaining
-					? `remaining: ${usageCache.remaining}`
-					: "remaining: unavailable (install the usage helper — see README)";
-			ctx.ui.notify(
-				`Qoder credits — ${remaining} · this omp process: ${sessionCredits.toFixed(4)} · all-time: ${allTime.toFixed(4)}`,
-				"info",
-			);
-		},
-	});
-	pi.registerProvider("qoder", {
+function buildProviderConfig() {
+	return {
 		baseUrl: "qoder://local-cli-bridge",
 		apiKey: "qodercli-local-auth",
 		api: "qoder-cli-bridge",
@@ -334,10 +324,57 @@ export default function qoderProvider(pi: ExtensionAPI) {
 			reasoning: true,
 			input: ["text", "image"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: spec.contextWindow,
+			contextWindow: activeContextWindow,
 			maxTokens: 16_384,
 		})),
+	};
+}
+
+export default function qoderProvider(pi: ExtensionAPI) {
+	pi.registerCommand("qoder-credits", {
+		description: "Show Qoder credits (remaining / this process / all-time)",
+		handler: async (_args, ctx) => {
+			const allTime = loadAllTimeCredits();
+			const report = await fetchQuotaReport();
+			const remaining =
+				report && usageCache?.remaining
+					? `remaining: ${usageCache.remaining}`
+					: "remaining: unavailable (install the usage helper — see README)";
+			ctx.ui.notify(
+				`Qoder credits — ${remaining} · this omp process: ${sessionCredits.toFixed(4)} · all-time: ${allTime.toFixed(4)}`,
+				"info",
+			);
+		},
 	});
+	pi.registerCommand("qoder-context", {
+		description: "Show or set the child context window (e.g. 200000 / 400000 / 1000000)",
+		handler: async (args, ctx) => {
+			const raw = (args ?? "").trim();
+			if (!raw) {
+				const tierNote = [200_000, 400_000, 1_000_000].includes(activeContextWindow) ? "" : " (not a documented tier)";
+				ctx.ui.notify(`qoder context window: ${activeContextWindow}${tierNote}`, "info");
+				return;
+			}
+			const size = Number(raw);
+			if (!Number.isInteger(size) || size < 100_000 || size > 2_000_000) {
+				ctx.ui.notify(`invalid context window: ${raw} — use an integer between 100000 and 2000000`, "warning");
+				return;
+			}
+			activeContextWindow = size;
+			try {
+				pi.unregisterProvider("qoder");
+			} catch {}
+			try {
+				pi.registerProvider("qoder", buildProviderConfig());
+			} catch (error) {
+				ctx.ui.notify(`context window set to ${size}, but re-registering the provider failed: ${String(error)}`, "warning");
+				return;
+			}
+			const tierNote = [200_000, 400_000, 1_000_000].includes(size) ? "" : " (not one of the documented tiers 200K/400K/1M)";
+			ctx.ui.notify(`qoder context window set to ${size}${tierNote} — new requests use it`, "info");
+		},
+	});
+	pi.registerProvider("qoder", buildProviderConfig());
 }
 
 async function runBridge(stream: AssistantMessageEventStream, model: unknown, context: unknown, options: unknown) {
@@ -371,7 +408,10 @@ async function runBridge(stream: AssistantMessageEventStream, model: unknown, co
 		"--mcp-config",
 		'{"mcpServers":{}}',
 	];
-	if (flag) args.push("-m", flag);
+	if (flag) {
+		args.push("-m", flag);
+		args.push("--context-window", String(activeContextWindow));
+	}
 	const maxTokens = isRecord(options) ? options.maxTokens : undefined;
 	if (typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0) {
 		args.push("--max-output-tokens", String(Math.floor(maxTokens)));

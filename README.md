@@ -1,6 +1,11 @@
 # omp qoder-provider
 
-Use [Qoder](https://qoder.com) as a model provider inside [omp](https://github.com/can1357/oh-my-pi) — officially supported surface only: the extension spawns the local `qodercli` binary in headless print mode per request and translates its stream-json output into canonical omp assistant-message events. No protocol impersonation, no API keys, no WAF tricks; the child authenticates with your own Qoder sign-in and bills your existing Qoder plan credits.
+Use [Qoder](https://qoder.com) as a model provider inside [omp](https://github.com/can1357/oh-my-pi) — officially supported surface only. Two providers ship in this repo:
+
+- **`qoder-acp/*`** (recommended) — spawns `qoder --acp`, the CLI's official Agent Client Protocol server, as a persistent child per omp session. Every tool call the child makes raises a **permission request answered inside omp**, file/terminal capabilities flow through the protocol, images are native, the child keeps its own context and streams real deltas. Requires Node 18+ (official `@agentclientprotocol/sdk`, Apache-2.0).
+- **`qoder/*`** (fallback) — spawns `qodercli -p --output-format stream-json` per request; simplest possible path, no SDK, text-block streaming only.
+
+Both authenticate with your own Qoder sign-in and bill your existing Qoder plan credits. No protocol impersonation, no API keys, no WAF tricks.
 
 > Independent community tool. Not affiliated with or endorsed by Qoder or the omp project.
 
@@ -76,16 +81,19 @@ Every response carries the credits it cost (`message.details.credits`, from the 
 | `QODER_BRIDGE_LOG` | unset | append spawn/result diagnostics to a file |
 | `QODER_BRIDGE_COST_AS_CREDITS` | off | mirror per-run credits into `usage.cost.total` |
 | `QODER_BRIDGE_CREDITS_FILE` | `~/.omp/agent/qoder-credits.json` | all-time credits ledger |
-| `QODER_BRIDGE_VENDOR_DIR` | `~/.omp/agent/vendor/qoder-sdk` | SDK install location for the remaining-quota helper |
+| `QODER_BRIDGE_VENDOR_DIR` | `~/.omp/agent/vendor/qoder-sdk` | SDK install location for the remaining-quota helper + ACP SDK |
 | `QODER_BRIDGE_USAGE_HELPER` | `<vendor dir>/qoder-usage-helper.cjs` | helper script run under Node |
+| `QODER_ACP_MODE` | `acceptEdits` | child session mode for `qoder-acp`: `default` (prompt for everything) / `acceptEdits` / `auto` |
+| `QODER_ACP_PERMISSIONS` | `allow` | how the extension answers permission requests that reach omp: `allow` / `deny` |
+| `QODER_ACP_BIN` | `qoder` | qoder binary for ACP mode |
+| `QODER_BRIDGE_CONTEXT_WINDOW` | `1000000` | context window for specific models (documented tiers: 200K/400K/1M); `auto`/`efficient` tiers keep their native window |
+| `QODER_BRIDGE_MAX_PROMPT_CHARS` | `4000000` | transcript size cap |
 
 ## Limitations
 
-- Delegate mode: the child never sees omp's tool schemas, and omp's tools are not bridged in; history is flattened to text (images travel as attachments, not per-turn placement).
-- One child run per request: repeated follow-ups re-send the whole transcript as text.
-- Stop reasons other than success map to stream errors (no length/toolUse distinction).
-- `contextWindow` metadata is a conservative 128k placeholder, not measured.
-- Images in tool results are not forwarded (only user-turn images).
+- `qoder` print-mode fallback: one child run per request, history flattened to text, whole-block streaming (no token deltas), stop reasons collapse to success/error, images in tool results are not forwarded.
+- `qoder-acp`: the child's context lives in the omp process (in-memory) — restarting omp starts a fresh child session; per-run credits are not surfaced by the ACP protocol yet; tool execution happens inside the child, gated by permission requests answered in omp (the standard ACP trust model).
+- Context window uses the documented tiers (200K/400K/1M, default 1M) via the official `--context-window` flag; not independently measured.
 
 ## Security notes
 
